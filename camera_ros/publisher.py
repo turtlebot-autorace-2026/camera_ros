@@ -4,7 +4,6 @@ from sensor_msgs.msg import CompressedImage
 import cv2
 import pickle
 import os
-import numpy as np
 
 class UndistortedVideoPublisher(Node):
     def __init__(self):
@@ -12,6 +11,8 @@ class UndistortedVideoPublisher(Node):
 
         # Publisher
         self.pub = self.create_publisher(CompressedImage, 'camera', 10)
+        self.raw_pub = self.create_publisher(CompressedImage, 'camera_raw', 10)
+        self.wide_raw_pub = self.create_publisher(CompressedImage, 'camera_raw_16_9', 10)
 
         # Load camera calibration
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,10 +27,16 @@ class UndistortedVideoPublisher(Node):
         self.dist_coeffs = calib_data['dist_coeffs']
 
         # Open camera
-        self.cap = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             self.get_logger().error("Cannot open camera.")
             return
+
+        # Capture one native 16:9 stream and derive the 4:3 view from it.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         # Prepare undistortion map
         ret, frame = self.cap.read()
@@ -37,6 +44,11 @@ class UndistortedVideoPublisher(Node):
             self.get_logger().error("Failed to grab a frame for calibration mapping.")
             return
         h, w = frame.shape[:2]
+        if (w, h) != (1280, 720):
+            self.cap.release()
+            raise RuntimeError(
+                f'Camera returned {w}x{h}; native 1280x720 capture is required.'
+            )
 
         # alpha=0 -> black area removal
         self.new_camera_matrix, self.roi = cv2.getOptimalNewCameraMatrix(
@@ -49,12 +61,24 @@ class UndistortedVideoPublisher(Node):
 
         # Timer ~30 FPS
         self.timer = self.create_timer(0.03, self.publish_frame)
+        self.get_logger().info(
+            'Publishing 1280x720 original frames on camera_raw_16_9, '
+            '640x480 center-cropped frames on camera_raw, '
+            'and undistorted frames on camera.'
+        )
 
     def publish_frame(self):
         ret, frame = self.cap.read()
         if not ret:
             self.get_logger().warn("Failed to grab frame.")
             return
+
+        stamp = self.get_clock().now().to_msg()
+
+        # Keep the native 16:9 frame intact; center-crop a separate 4:3 view.
+        self.publish_compressed(self.wide_raw_pub, frame, stamp)
+        raw_4_3 = cv2.resize(frame[:, 160:1120], (640, 480), interpolation=cv2.INTER_AREA)
+        self.publish_compressed(self.raw_pub, raw_4_3, stamp)
 
         # Undistort
         undistorted = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
@@ -72,16 +96,19 @@ class UndistortedVideoPublisher(Node):
             return
         '''
         
-        # Publish as CompressedImage
-        msg = CompressedImage()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.format = 'jpeg'
-        ret, buffer = cv2.imencode('.jpg', undistorted)
+        self.publish_compressed(self.pub, undistorted, stamp)
+
+    def publish_compressed(self, publisher, frame, stamp):
+        """Publish a JPEG frame with the timestamp shared by all three views."""
+        ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
-            self.get_logger().warn("Failed to encode frame.")
+            self.get_logger().warn(f'Failed to encode frame for {publisher.topic_name}.')
             return
-        msg.data = np.array(buffer).tobytes()
-        self.pub.publish(msg)
+        msg = CompressedImage()
+        msg.header.stamp = stamp
+        msg.format = 'jpeg'
+        msg.data = buffer.tobytes()
+        publisher.publish(msg)
 
 
 def main(args=None):
